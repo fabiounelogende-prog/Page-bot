@@ -4,21 +4,47 @@ const request = require('request');
 const { sendMessage } = require('./sendMessage');
 
 const commands = new Map();
-const commandFiles = fs.readdirSync(path.join(__dirname, '../commands')).filter(file => file.endsWith('.js'));
+
+// Chargement des commandes
+const commandsPath = path.join(__dirname, '../commands');
+
+const commandFiles = fs.readdirSync(commandsPath)
+  .filter(file => file.endsWith('.js'));
+
 for (const file of commandFiles) {
-  const command = require(`../commands/${file}`);
-  commands.set(command.name, command);
+  try {
+    const command = require(path.join(commandsPath, file));
+
+    if (command && command.name && typeof command.execute === 'function') {
+      commands.set(command.name.toLowerCase(), command);
+
+      if (Array.isArray(command.aliases)) {
+        for (const alias of command.aliases) {
+          commands.set(alias.toLowerCase(), command);
+        }
+      }
+
+      console.log(`Commande chargée : ${command.name}`);
+    } else {
+      console.warn(`Commande ignorée : ${file}`);
+    }
+  } catch (error) {
+    console.error(`Erreur de chargement ${file}:`, error.message);
+  }
 }
 
-// rui: add commands list
+// Configuration des commandes Messenger
 async function setupCommands(pageAccessToken) {
   const commandsData = {
     commands: [
       {
-        locale: "default",
-        commands: Array.from(commands.values()).map(command => ({
+        locale: 'default',
+        commands: Array.from(
+          new Set(commands.values())
+        ).map(command => ({
           name: command.name,
-          description: `${command.description} (by ${command.author})`
+          description: `${command.description || 'Commande Messenger'}`
+            .slice(0, 200)
         }))
       }
     ]
@@ -26,38 +52,89 @@ async function setupCommands(pageAccessToken) {
 
   return new Promise((resolve, reject) => {
     request({
-      uri: `https://graph.facebook.com/v21.0/me/messenger_profile`,
+      uri: 'https://graph.facebook.com/v21.0/me/messenger_profile',
       qs: { access_token: pageAccessToken },
       method: 'POST',
       json: commandsData
     }, (error, response, body) => {
-      if (!error && response.statusCode === 200) {
-        console.log('Commands set successfully:', body);
-        resolve(body);
-      } else {
-        console.error('Error setting commands:', error || body.error);
-        reject(error || body.error);
+      if (error) {
+        console.error('Erreur Messenger Profile :', error.message);
+        return reject(error);
       }
+
+      if (response.statusCode === 200) {
+        console.log('Commandes Messenger configurées.');
+        return resolve(body);
+      }
+
+      const apiError = new Error(
+        body?.error?.message || 'Échec de configuration des commandes.'
+      );
+
+      console.error('Erreur Meta :', apiError.message);
+      return reject(apiError);
     });
   });
-};
+}
 
+// Traitement des messages reçus
 async function handleMessage(event, pageAccessToken) {
-  const senderId = event.sender.id;
-  const messageText = event.message.text.toLowerCase();
+  try {
+    const senderId = event?.sender?.id;
+    const message = event?.message;
 
-  const args = messageText.split(' ');
-  const commandName = args.shift();
+    if (!senderId || !message) return;
 
-  if (commands.has(commandName)) {
+    // Ignorer les messages sans texte
+    if (typeof message.text !== 'string' || !message.text.trim()) {
+      return;
+    }
+
+    const messageText = message.text.trim();
+    const args = messageText.split(/\s+/);
+    const commandName = args.shift().toLowerCase();
+
+    console.log(
+      `Message reçu de ${senderId} : ${messageText}`
+    );
+
+    // Recherche de la commande
     const command = commands.get(commandName);
-    try {
-      await command.execute(senderId, args, pageAccessToken, sendMessage);
-    } catch (error) {
-      console.error(`Error executing command ${commandName}:`, error);
-      sendMessage(senderId, { text: 'There was an error executing that command.' }, pageAccessToken);
+
+    if (!command) {
+      console.log(`Aucune commande trouvée : ${commandName}`);
+      return;
+    }
+
+    console.log(`Exécution de la commande : ${command.name}`);
+
+    await command.execute(
+      senderId,
+      args,
+      pageAccessToken,
+      sendMessage
+    );
+
+  } catch (error) {
+    console.error('Erreur handleMessage :', error);
+
+    if (event?.sender?.id) {
+      try {
+        await sendMessage(
+          event.sender.id,
+          {
+            text: 'Une erreur est survenue pendant le traitement de ta commande.'
+          },
+          pageAccessToken
+        );
+      } catch (sendError) {
+        console.error('Erreur envoi du message :', sendError);
+      }
     }
   }
 }
 
-module.exports = { handleMessage, setupCommands };
+module.exports = {
+  handleMessage,
+  setupCommands
+};
